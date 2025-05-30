@@ -65,7 +65,7 @@ brew install --cask raspberry-pi-imager
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/rm3100-flight.git
+git clone https://github.com/lundeen06/rm3100-flight.git
 cd rm3100-flight
 
 # Create build directory
