@@ -11,7 +11,7 @@
 #define SPI_SCK  2   // GPIO 2 - SCK
 #define SPI_MOSI 3   // GPIO 3 - MOSI
 #define SPI_MISO 4   // GPIO 4 - MISO
-#define SPI_CS   5   // GPIO 5 - SSN
+#define SPI_CS   5   // GPIO 5 - CS
 
 // Add binary info for picotool
 bi_decl(bi_4pins_with_func(SPI_MISO, SPI_MOSI, SPI_SCK, SPI_CS, GPIO_FUNC_SPI));
@@ -136,41 +136,118 @@ bool read_sample(float* x, float* y, float* z, float* magnitude) {
     return true;
 }
 
+static inline bool rm3100_get_buf(uint8_t reg, uint8_t* buf, uint32_t n) {
+    // Select the chip (CS low)
+    spi_cs_select();
+
+    // Send the register address with read command
+    uint8_t cmd = reg | 0x80;
+
+    // Send command byte to specify which register to read
+    int ret = spi_write_blocking(SPI_PORT, &cmd, 1);
+    if (ret != 1) {
+        spi_cs_deselect();
+        return false;
+    }
+
+    // Read the register data - send dummy byte to read
+    ret = spi_read_blocking(SPI_PORT, 0, buf, n);
+
+    // Deselect the chip (CS high)
+    spi_cs_deselect();
+
+    return ret == n;
+}
+
+bool rm3100_verify_connection() {
+    uint8_t revid = 0xAA;  // Set to known value first
+    
+    printf("Before read: revid = 0x%02X\n", revid);
+    
+    // Read the REVID register (0x36) - should return 0x22
+    if (!rm3100_get_buf(RM3100_REG_REVID, &revid, 1)) {
+        printf("Failed to read REVID register (SPI error)\n");
+        return false;
+    }
+    
+    printf("After read: revid = 0x%02X\n", revid);
+    printf("REVID read: 0x%02X (expected: 0x%02X)\n", revid, RM3100_REVID);
+    
+    if (revid == RM3100_REVID) {
+        printf("RM3100 magnetometer detected and verified!\n");
+        return true;
+    } else {
+        printf("RM3100 not detected - wrong revision ID\n");
+        return false;
+    }
+}
+
 int main() {
     stdio_init_all();
     sleep_ms(5000);
     printf("rm3100.cpp running :D\n");
     
-    spi_init(SPI_PORT, 1000 * 1000);
+    // Initialize SPI FIRST before trying to communicate
+    spi_init(SPI_PORT, 100 * 1000);
     spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
-    
+
     gpio_set_function(SPI_SCK, GPIO_FUNC_SPI);
     gpio_set_function(SPI_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(SPI_MISO, GPIO_FUNC_SPI);
     
     gpio_init(SPI_CS);
     gpio_set_dir(SPI_CS, GPIO_OUT);
-    gpio_put(SPI_CS, 1);
+    gpio_put(SPI_CS, 1);  // Start with CS high (deselected)
     
-    printf("Timestamp(ms),M_x(µT),M_y(µT),M_z(µT),M(µT)\n");
+    printf("SPI initialized, testing RM3100 connection...\n");
     
     while (true) {
-        if (!sensor_connected) {
-            if (init_sensor()) {
-                sensor_connected = true;
-            }
+        if (rm3100_verify_connection()) {
+            printf("Sensor verification successful!\n");
         } else {
-            float x, y, z, magnitude;
-            if (read_sample(&x, &y, &z, &magnitude)) {
-                printf("%llu,%.3f,%.3f,%.3f,%.3f\n", 
-                    time_us_64() / 1000, x, y, z, magnitude);
-            } else {
-                sensor_connected = false;
-            }
+            printf("Sensor verification failed!\n");
         }
-        printf(sensor_connected ? "sensor connected\n" : "sensor not connected\n"); // debugging
-        sleep_ms(10);
+        sleep_ms(1000);  // Add this line - test every second
     }
-    
     return 0;
 }
+
+
+// int main() {
+//     stdio_init_all();
+//     sleep_ms(5000);
+//     printf("rm3100.cpp running :D\n");
+    
+    // spi_init(SPI_PORT, 1000 * 1000);
+    // spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    
+    // gpio_set_function(SPI_SCK, GPIO_FUNC_SPI);
+    // gpio_set_function(SPI_MOSI, GPIO_FUNC_SPI);
+    // gpio_set_function(SPI_MISO, GPIO_FUNC_SPI);
+    
+    // gpio_init(SPI_CS);
+    // gpio_set_dir(SPI_CS, GPIO_OUT);
+    // gpio_put(SPI_CS, 1);
+    
+    // printf("Timestamp(ms),M_x(µT),M_y(µT),M_z(µT),M(µT)\n");
+    
+    // while (true) {
+    //     if (!sensor_connected) {
+    //         if (init_sensor()) {
+    //             sensor_connected = true;
+    //         }
+    //     } else {
+    //         float x, y, z, magnitude;
+    //         if (read_sample(&x, &y, &z, &magnitude)) {
+    //             printf("%llu,%.3f,%.3f,%.3f,%.3f\n", 
+    //                 time_us_64() / 1000, x, y, z, magnitude);
+    //         } else {
+    //             sensor_connected = false;
+    //         }
+    //     }
+    //     printf(sensor_connected ? "sensor connected\n" : "sensor not connected\n"); // debugging
+    //     sleep_ms(10);
+    // }
+    
+    // return 0;
+// }
