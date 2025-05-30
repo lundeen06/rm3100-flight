@@ -6,248 +6,263 @@
 #include "pico/binary_info.h"
 #include <cmath>
 
-// TODO: change pinout for adcs board
-// Pin definitions for SPI
+// Pin definitions for SPI - TODO: Update for ADCS board
 #define SPI_PORT spi0
 #define SPI_SCK  2   // GPIO 2 - SCK
 #define SPI_MOSI 3   // GPIO 3 - MOSI
 #define SPI_MISO 4   // GPIO 4 - MISO
 #define SPI_CS   5   // GPIO 5 - CS
 
-// Add binary info for picotool
-bi_decl(bi_4pins_with_func(SPI_MISO, SPI_MOSI, SPI_SCK, SPI_CS, GPIO_FUNC_SPI));
-bi_decl(bi_program_description("RM3100 Magnetometer Reader - SPI Interface"));
+// RM3100 Register Map
+#define RM3100_REG_POLL   0x00  // Single Measurement Trigger
+#define RM3100_REG_CMM    0x01  // Continuous Measurement Mode
+#define RM3100_REG_CCX    0x04  // Cycle Count X Register
+#define RM3100_REG_CCY    0x06  // Cycle Count Y Register
+#define RM3100_REG_CCZ    0x08  // Cycle Count Z Register
+#define RM3100_REG_TMRC   0x0B  // Continuous Mode Data Rate
+#define RM3100_REG_MX     0x24  // Measurement Results X
+#define RM3100_REG_MY     0x27  // Measurement Results Y
+#define RM3100_REG_MZ     0x2A  // Measurement Results Z
+#define RM3100_REG_STATUS 0x34  // Status Register
+#define RM3100_REG_REVID  0x36  // Hardware Revision ID
 
-// Register Map
-#define RM3100_REG_POLL   0x00
-#define RM3100_REG_CMM    0x01
-#define RM3100_REG_CCX    0x04
-#define RM3100_REG_CCY    0x06
-#define RM3100_REG_CCZ    0x08
-#define RM3100_REG_TMRC   0x0B
-#define RM3100_REG_MX     0x24
-#define RM3100_REG_MY     0x27
-#define RM3100_REG_MZ     0x2A
-#define RM3100_REG_STATUS 0x34
-#define RM3100_REG_REVID  0x36
-
-#define RM3100_REVID 0x22
-#define RM3100_CMM_RATE_75_0_HZ  0x05
+// RM3100 Configuration Constants
+#define RM3100_REVID             0x22
+#define RM3100_CYCLE_COUNT       200    // Cycle count for all axes (affects resolution/speed)
+#define RM3100_CMM_RATE_75_HZ    0x05
 #define RM3100_CMM_RATE_MSB      0x90
-#define RM3100_DRDM_ALL_AXES 0x02
+#define RM3100_DRDM_ALL_AXES     0x02
+#define RM3100_LSB_PER_UT        75.0f  // LSB per microTesla at CC=200
 
-bool sensor_connected = false;
+// Data structure for magnetometer readings
+typedef struct {
+    float x;         // X-axis magnetic field in microTesla
+    float y;         // Y-axis magnetic field in microTesla  
+    float z;         // Z-axis magnetic field in microTesla
+    float magnitude; // Total field magnitude in microTesla
+    uint64_t timestamp_ms; // Timestamp in milliseconds
+    bool valid;      // Data validity flag
+} rm3100_data_t;
 
-void spi_cs_select() {
+// Error codes
+typedef enum {
+    RM3100_OK = 0,
+    RM3100_ERROR_SPI_COMM,
+    RM3100_ERROR_WRONG_CHIP_ID,
+    RM3100_ERROR_CONFIG_FAILED,
+    RM3100_ERROR_NO_DATA_READY,
+    RM3100_ERROR_INVALID_PARAM
+} rm3100_error_t;
+
+// Binary info for picotool
+bi_decl(bi_4pins_with_func(SPI_MISO, SPI_MOSI, SPI_SCK, SPI_CS, GPIO_FUNC_SPI));
+bi_decl(bi_program_description("RM3100 Magnetometer Flight Driver"));
+
+// Private SPI helper functions
+static inline void rm3100_cs_select(void) {
     gpio_put(SPI_CS, 0);
 }
 
-void spi_cs_deselect() {
+static inline void rm3100_cs_deselect(void) {
     gpio_put(SPI_CS, 1);
 }
 
-bool spi_write_reg(uint8_t reg, const uint8_t* data, size_t len) {
-    uint8_t cmd = reg;
+static bool rm3100_spi_write_reg(uint8_t reg, const uint8_t* data, size_t len) {
+    rm3100_cs_select();
     
-    spi_cs_select();
-    int ret = spi_write_blocking(SPI_PORT, &cmd, 1);
+    // Send register address (write command)
+    int ret = spi_write_blocking(SPI_PORT, &reg, 1);
     if (ret != 1) {
-        spi_cs_deselect();
+        rm3100_cs_deselect();
         return false;
     }
+    
+    // Send data
     ret = spi_write_blocking(SPI_PORT, data, len);
-    spi_cs_deselect();
+    rm3100_cs_deselect();
     
-    return ret == len;
+    return ret == (int)len;
 }
 
-bool spi_read_reg(uint8_t reg, uint8_t* data, size_t len) {
-    uint8_t cmd = reg | 0x80;
+static bool rm3100_spi_read_reg(uint8_t reg, uint8_t* data, size_t len) {
+    uint8_t cmd = reg | 0x80; // Set MSB for read command
     
-    spi_cs_select();
+    rm3100_cs_select();
+    
+    // Send register address (read command)
     int ret = spi_write_blocking(SPI_PORT, &cmd, 1);
     if (ret != 1) {
-        spi_cs_deselect();
+        rm3100_cs_deselect();
         return false;
     }
+    
+    // Read data
     ret = spi_read_blocking(SPI_PORT, 0, data, len);
-    spi_cs_deselect();
+    rm3100_cs_deselect();
     
-    return ret == len;
+    return ret == (int)len;
 }
 
-bool init_sensor() {
-    uint8_t rev;
-    if (!spi_read_reg(RM3100_REG_REVID, &rev, 1)) {
-        return false;
-    }
-    
-    if (rev != RM3100_REVID) {
-        return false;
-    }
-    
-    uint8_t cc_buffer[6] = {0, 200, 0, 200, 0, 200};
-    if (!spi_write_reg(RM3100_REG_CCX, cc_buffer, 6)) {
-        return false;
-    }
-    
-    uint8_t rate = RM3100_CMM_RATE_75_0_HZ | RM3100_CMM_RATE_MSB;
-    if (!spi_write_reg(RM3100_REG_TMRC, &rate, 1)) {
-        return false;
-    }
-    
-    uint8_t cmm = (1 << 0) | (RM3100_DRDM_ALL_AXES << 2) | (1 << 4) | (1 << 5) | (1 << 6);
-    if (!spi_write_reg(RM3100_REG_CMM, &cmm, 1)) {
-        return false;
-    }
-    
-    return true;
-}
-
-bool read_sample(float* x, float* y, float* z, float* magnitude) {
-    uint8_t status;
-    if (!spi_read_reg(RM3100_REG_STATUS, &status, 1)) {
-        return false;
-    }
-    
-    if (!(status & 0x80)) {
-        return false;
-    }
-    
-    uint8_t data[9];
-    if (!spi_read_reg(RM3100_REG_MX, data, 9)) {
-        return false;
-    }
-    
-    int32_t raw_x = ((int32_t)data[0] << 16) | ((int32_t)data[1] << 8) | data[2];
-    int32_t raw_y = ((int32_t)data[3] << 16) | ((int32_t)data[4] << 8) | data[5];
-    int32_t raw_z = ((int32_t)data[6] << 16) | ((int32_t)data[7] << 8) | data[8];
-    
-    if (raw_x & 0x800000) raw_x |= 0xFF000000;
-    if (raw_y & 0x800000) raw_y |= 0xFF000000;
-    if (raw_z & 0x800000) raw_z |= 0xFF000000;
-    
-    const float scale = 1.0f / 75.0f;
-    *x = raw_x * scale;
-    *y = raw_y * scale;
-    *z = raw_z * scale;
-    
-    *magnitude = std::sqrt((*x * *x) + (*y * *y) + (*z * *z));
-    
-    return true;
-}
-
-static inline bool rm3100_get_buf(uint8_t reg, uint8_t* buf, uint32_t n) {
-    // Select the chip (CS low)
-    spi_cs_select();
-
-    // Send the register address with read command
-    uint8_t cmd = reg | 0x80;
-
-    // Send command byte to specify which register to read
-    int ret = spi_write_blocking(SPI_PORT, &cmd, 1);
-    if (ret != 1) {
-        spi_cs_deselect();
-        return false;
-    }
-
-    // Read the register data - send dummy byte to read
-    ret = spi_read_blocking(SPI_PORT, 0, buf, n);
-
-    // Deselect the chip (CS high)
-    spi_cs_deselect();
-
-    return ret == n;
-}
-
-bool rm3100_verify_connection() {
-    uint8_t revid = 0xAA;  // Set to known value first
-    
-    printf("Before read: revid = 0x%02X\n", revid);
-    
-    // Read the REVID register (0x36) - should return 0x22
-    if (!rm3100_get_buf(RM3100_REG_REVID, &revid, 1)) {
-        printf("Failed to read REVID register (SPI error)\n");
-        return false;
-    }
-    
-    printf("After read: revid = 0x%02X\n", revid);
-    printf("REVID read: 0x%02X (expected: 0x%02X)\n", revid, RM3100_REVID);
-    
-    if (revid == RM3100_REVID) {
-        printf("RM3100 magnetometer detected and verified!\n");
-        return true;
-    } else {
-        printf("RM3100 not detected - wrong revision ID\n");
-        return false;
-    }
-}
-
-// int main() {
-//     stdio_init_all();
-//     sleep_ms(5000);
-//     printf("rm3100.cpp running :D\n");
-    
-//     // Initialize SPI FIRST before trying to communicate
-//     spi_init(SPI_PORT, 100 * 1000);
-//     spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
-
-//     gpio_set_function(SPI_SCK, GPIO_FUNC_SPI);
-//     gpio_set_function(SPI_MOSI, GPIO_FUNC_SPI);
-//     gpio_set_function(SPI_MISO, GPIO_FUNC_SPI);
-    
-//     gpio_init(SPI_CS);
-//     gpio_set_dir(SPI_CS, GPIO_OUT);
-//     gpio_put(SPI_CS, 1);  // Start with CS high (deselected)
-    
-//     printf("SPI initialized, testing RM3100 connection...\n");
-    
-//     while (true) {
-//         if (rm3100_verify_connection()) {
-//             printf("Sensor verification successful!\n");
-//         } else {
-//             printf("Sensor verification failed!\n");
-//         }
-//         sleep_ms(1000);  // Add this line - test every second
-//     }
-//     return 0;
-// }
-
-
-int main() {
-    stdio_init_all();
-    sleep_ms(5000);
-    printf("rm3100.cpp running :D\n");
-    
-    spi_init(SPI_PORT, 1000 * 1000);
+/**
+ * @brief Initialize RM3100 magnetometer
+ * 
+ * This function initializes the SPI interface and configures the RM3100
+ * magnetometer for continuous measurement mode. It verifies chip presence
+ * by reading the revision ID register.
+ * 
+ * @return rm3100_error_t Error code (RM3100_OK on success)
+ */
+rm3100_error_t rm3100_init(void) {
+    // Initialize SPI interface
+    spi_init(SPI_PORT, 1000 * 1000); // 1 MHz SPI clock
     spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
     
+    // Configure SPI pins
     gpio_set_function(SPI_SCK, GPIO_FUNC_SPI);
     gpio_set_function(SPI_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(SPI_MISO, GPIO_FUNC_SPI);
     
+    // Configure CS pin manually
     gpio_init(SPI_CS);
     gpio_set_dir(SPI_CS, GPIO_OUT);
-    gpio_put(SPI_CS, 1);
+    gpio_put(SPI_CS, 1); // Start deselected
     
-    printf("Timestamp(ms),M_x(µT),M_y(µT),M_z(µT),M(µT)\n");
+    // Small delay for SPI to stabilize
+    sleep_ms(10);
+    
+    // Verify chip presence by reading revision ID
+    uint8_t revision_id;
+    if (!rm3100_spi_read_reg(RM3100_REG_REVID, &revision_id, 1)) {
+        return RM3100_ERROR_SPI_COMM;
+    }
+    
+    if (revision_id != RM3100_REVID) {
+        return RM3100_ERROR_WRONG_CHIP_ID;
+    }
+    
+    // Configure cycle counts for all axes (affects resolution and measurement time)
+    uint8_t cycle_counts[6] = {
+        0, RM3100_CYCLE_COUNT,  // X-axis: MSB, LSB
+        0, RM3100_CYCLE_COUNT,  // Y-axis: MSB, LSB  
+        0, RM3100_CYCLE_COUNT   // Z-axis: MSB, LSB
+    };
+    
+    if (!rm3100_spi_write_reg(RM3100_REG_CCX, cycle_counts, 6)) {
+        return RM3100_ERROR_CONFIG_FAILED;
+    }
+    
+    // Set continuous measurement mode data rate (75 Hz)
+    uint8_t data_rate = RM3100_CMM_RATE_75_HZ | RM3100_CMM_RATE_MSB;
+    if (!rm3100_spi_write_reg(RM3100_REG_TMRC, &data_rate, 1)) {
+        return RM3100_ERROR_CONFIG_FAILED;
+    }
+    
+    // Enable continuous measurement mode for all axes
+    uint8_t cmm_config = (1 << 0) |                    // START bit
+                        (RM3100_DRDM_ALL_AXES << 2) |  // DRDY after all axes
+                        (1 << 4) |                      // CMX enable
+                        (1 << 5) |                      // CMY enable  
+                        (1 << 6);                       // CMZ enable
+    
+    if (!rm3100_spi_write_reg(RM3100_REG_CMM, &cmm_config, 1)) {
+        return RM3100_ERROR_CONFIG_FAILED;
+    }
+    
+    return RM3100_OK;
+}
+
+/**
+ * @brief Get magnetometer reading
+ * 
+ * This function reads the latest magnetometer data from the RM3100.
+ * It checks if new data is available and converts raw readings to
+ * engineering units (microTesla).
+ * 
+ * @param data Pointer to rm3100_data_t structure to store results
+ * @return rm3100_error_t Error code (RM3100_OK on success)
+ */
+rm3100_error_t rm3100_get_reading(rm3100_data_t* data) {
+    if (data == NULL) {
+        return RM3100_ERROR_INVALID_PARAM;
+    }
+    
+    // Initialize data structure
+    data->valid = false;
+    data->timestamp_ms = time_us_64() / 1000;
+    
+    // Check if new data is ready
+    uint8_t status;
+    if (!rm3100_spi_read_reg(RM3100_REG_STATUS, &status, 1)) {
+        return RM3100_ERROR_SPI_COMM;
+    }
+    
+    if (!(status & 0x80)) { // DRDY bit not set
+        return RM3100_ERROR_NO_DATA_READY;
+    }
+    
+    // Read all measurement registers (9 bytes: 3 per axis)
+    uint8_t raw_data[9];
+    if (!rm3100_spi_read_reg(RM3100_REG_MX, raw_data, 9)) {
+        return RM3100_ERROR_SPI_COMM;
+    }
+    
+    // Convert 24-bit signed values to 32-bit signed integers
+    int32_t raw_x = ((int32_t)raw_data[0] << 16) | ((int32_t)raw_data[1] << 8) | raw_data[2];
+    int32_t raw_y = ((int32_t)raw_data[3] << 16) | ((int32_t)raw_data[4] << 8) | raw_data[5];
+    int32_t raw_z = ((int32_t)raw_data[6] << 16) | ((int32_t)raw_data[7] << 8) | raw_data[8];
+    
+    // Sign extend from 24-bit to 32-bit
+    if (raw_x & 0x800000) raw_x |= 0xFF000000;
+    if (raw_y & 0x800000) raw_y |= 0xFF000000;
+    if (raw_z & 0x800000) raw_z |= 0xFF000000;
+    
+    // Convert to microTesla using calibrated scale factor
+    const float scale = 1.0f / RM3100_LSB_PER_UT;
+    data->x = raw_x * scale;
+    data->y = raw_y * scale;
+    data->z = raw_z * scale;
+    
+    // Calculate total field magnitude
+    data->magnitude = sqrtf((data->x * data->x) + (data->y * data->y) + (data->z * data->z));
+    
+    data->valid = true;
+    return RM3100_OK;
+}
+
+// Example usage
+int main() {
+    stdio_init_all();
+    sleep_ms(2000); // Allow USB enumeration
+    
+    printf("RM3100 Flight Driver Initializing...\n");
+    
+    // Initialize magnetometer
+    rm3100_error_t init_result = rm3100_init();
+    if (init_result != RM3100_OK) {
+        printf("ERROR: RM3100 initialization failed with code %d\n", init_result);
+        return -1;
+    }
+    
+    printf("RM3100 initialized successfully\n");
+    printf("Timestamp(ms),M_x(µT),M_y(µT),M_z(µT),M_total(µT)\n");
+    
+    rm3100_data_t mag_data;
     
     while (true) {
-        if (!sensor_connected) {
-            if (init_sensor()) {
-                sensor_connected = true;
-            }
-        } else {
-            float x, y, z, magnitude;
-            if (read_sample(&x, &y, &z, &magnitude)) {
-                printf("%llu,%.3f,%.3f,%.3f,%.3f\n", 
-                    time_us_64() / 1000, x, y, z, magnitude);
-            } else {
-                sensor_connected = false;
-            }
+        rm3100_error_t result = rm3100_get_reading(&mag_data);
+        
+        if (result == RM3100_OK && mag_data.valid) {
+            printf("%llu,%.3f,%.3f,%.3f,%.3f\n", 
+                   mag_data.timestamp_ms,
+                   mag_data.x, 
+                   mag_data.y, 
+                   mag_data.z, 
+                   mag_data.magnitude);
+        } else if (result != RM3100_ERROR_NO_DATA_READY) {
+            printf("ERROR: Failed to read magnetometer data, code %d\n", result);
         }
-        // printf(sensor_connected ? "sensor connected\n" : "sensor not connected\n"); // debugging
-        sleep_ms(10);
+        
+        // sleep_ms(1); // 20 Hz reading rate
     }
     
     return 0;
