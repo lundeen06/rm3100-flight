@@ -6,6 +6,7 @@
 #include "pico/binary_info.h"
 #include <cmath>
 
+// TODO: change pinout for adcs board
 // Pin definitions for SPI
 #define SPI_PORT spi0
 #define SPI_SCK  2   // GPIO 2 - SCK
@@ -182,72 +183,72 @@ bool rm3100_verify_connection() {
     }
 }
 
+// int main() {
+//     stdio_init_all();
+//     sleep_ms(5000);
+//     printf("rm3100.cpp running :D\n");
+    
+//     // Initialize SPI FIRST before trying to communicate
+//     spi_init(SPI_PORT, 100 * 1000);
+//     spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+
+//     gpio_set_function(SPI_SCK, GPIO_FUNC_SPI);
+//     gpio_set_function(SPI_MOSI, GPIO_FUNC_SPI);
+//     gpio_set_function(SPI_MISO, GPIO_FUNC_SPI);
+    
+//     gpio_init(SPI_CS);
+//     gpio_set_dir(SPI_CS, GPIO_OUT);
+//     gpio_put(SPI_CS, 1);  // Start with CS high (deselected)
+    
+//     printf("SPI initialized, testing RM3100 connection...\n");
+    
+//     while (true) {
+//         if (rm3100_verify_connection()) {
+//             printf("Sensor verification successful!\n");
+//         } else {
+//             printf("Sensor verification failed!\n");
+//         }
+//         sleep_ms(1000);  // Add this line - test every second
+//     }
+//     return 0;
+// }
+
+
 int main() {
     stdio_init_all();
     sleep_ms(5000);
     printf("rm3100.cpp running :D\n");
     
-    // Initialize SPI FIRST before trying to communicate
-    spi_init(SPI_PORT, 100 * 1000);
+    spi_init(SPI_PORT, 1000 * 1000);
     spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
-
+    
     gpio_set_function(SPI_SCK, GPIO_FUNC_SPI);
     gpio_set_function(SPI_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(SPI_MISO, GPIO_FUNC_SPI);
     
     gpio_init(SPI_CS);
     gpio_set_dir(SPI_CS, GPIO_OUT);
-    gpio_put(SPI_CS, 1);  // Start with CS high (deselected)
+    gpio_put(SPI_CS, 1);
     
-    printf("SPI initialized, testing RM3100 connection...\n");
+    printf("Timestamp(ms),M_x(µT),M_y(µT),M_z(µT),M(µT)\n");
     
     while (true) {
-        if (rm3100_verify_connection()) {
-            printf("Sensor verification successful!\n");
+        if (!sensor_connected) {
+            if (init_sensor()) {
+                sensor_connected = true;
+            }
         } else {
-            printf("Sensor verification failed!\n");
+            float x, y, z, magnitude;
+            if (read_sample(&x, &y, &z, &magnitude)) {
+                printf("%llu,%.3f,%.3f,%.3f,%.3f\n", 
+                    time_us_64() / 1000, x, y, z, magnitude);
+            } else {
+                sensor_connected = false;
+            }
         }
-        sleep_ms(1000);  // Add this line - test every second
+        // printf(sensor_connected ? "sensor connected\n" : "sensor not connected\n"); // debugging
+        sleep_ms(10);
     }
+    
     return 0;
 }
-
-
-// int main() {
-//     stdio_init_all();
-//     sleep_ms(5000);
-//     printf("rm3100.cpp running :D\n");
-    
-    // spi_init(SPI_PORT, 1000 * 1000);
-    // spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
-    
-    // gpio_set_function(SPI_SCK, GPIO_FUNC_SPI);
-    // gpio_set_function(SPI_MOSI, GPIO_FUNC_SPI);
-    // gpio_set_function(SPI_MISO, GPIO_FUNC_SPI);
-    
-    // gpio_init(SPI_CS);
-    // gpio_set_dir(SPI_CS, GPIO_OUT);
-    // gpio_put(SPI_CS, 1);
-    
-    // printf("Timestamp(ms),M_x(µT),M_y(µT),M_z(µT),M(µT)\n");
-    
-    // while (true) {
-    //     if (!sensor_connected) {
-    //         if (init_sensor()) {
-    //             sensor_connected = true;
-    //         }
-    //     } else {
-    //         float x, y, z, magnitude;
-    //         if (read_sample(&x, &y, &z, &magnitude)) {
-    //             printf("%llu,%.3f,%.3f,%.3f,%.3f\n", 
-    //                 time_us_64() / 1000, x, y, z, magnitude);
-    //         } else {
-    //             sensor_connected = false;
-    //         }
-    //     }
-    //     printf(sensor_connected ? "sensor connected\n" : "sensor not connected\n"); // debugging
-    //     sleep_ms(10);
-    // }
-    
-    // return 0;
-// }
